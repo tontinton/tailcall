@@ -45,6 +45,7 @@ use std::hash::Hash;
 use std::num::NonZeroU64;
 
 use async_graphql_value::ConstValue;
+use futures_util::Stream;
 use http::Response;
 use ir::model::IoId;
 pub use mustache::Mustache;
@@ -61,6 +62,13 @@ pub trait HttpIO: Sync + Send + 'static {
         &self,
         request: reqwest::Request,
     ) -> anyhow::Result<Response<hyper::body::Bytes>>;
+
+    async fn stream(
+        &self,
+        _request: reqwest::Request,
+    ) -> anyhow::Result<Response<Box<dyn Stream<Item = reqwest::Result<hyper::body::Bytes>>>>> {
+        anyhow::bail!("Stream IO unsupported currently on this type")
+    }
 }
 
 #[async_trait::async_trait]

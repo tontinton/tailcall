@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use futures_util::Stream;
 use hyper::{HeaderMap, Method};
 use reqwest::Request;
 use url::Url;
@@ -23,6 +24,28 @@ pub async fn execute_grpc_request(
     request: Request,
 ) -> Result<Response<async_graphql::Value>> {
     let response = runtime.http2_only.execute(request).await?;
+
+    let grpc_status = response
+        .headers
+        .get(GRPC_STATUS)
+        .and_then(|header_value| header_value.to_str().ok());
+
+    if response.status.is_success() {
+        return if grpc_status.is_none() || grpc_status == Some("0") {
+            response.to_grpc_value(operation)
+        } else {
+            Err(response.to_grpc_error(operation))
+        };
+    }
+    bail!("Failed to execute request");
+}
+
+pub async fn execute_grpc_stream_request(
+    runtime: &TargetRuntime,
+    operation: &ProtobufOperation,
+    request: Request,
+) -> Result<Response<Box<dyn Stream<Item = async_graphql::Value>>>> {
+    let response = runtime.http2_only.stream(request).await?;
 
     let grpc_status = response
         .headers

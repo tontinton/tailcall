@@ -1,6 +1,8 @@
 use anyhow::Result;
 use async_graphql_value::{ConstValue, Name};
+use async_std::stream::StreamExt;
 use derive_setters::Setters;
+use futures_util::Stream;
 use hyper::body::Bytes;
 use hyper::Body;
 use indexmap::IndexMap;
@@ -45,6 +47,58 @@ impl FromValue for ConstValue {
                     .collect(),
             ),
         }
+    }
+}
+
+impl Response<Body> {
+    pub fn to_grpc_error(&self, operation: &ProtobufOperation) -> anyhow::Error {
+        let grpc_status = match Status::from_header_map(&self.headers) {
+            Some(status) => status,
+            None => {
+                return Error::IOException("Error while parsing upstream headers".to_owned()).into()
+            }
+        };
+
+        let mut obj: IndexMap<Name, async_graphql::Value> = IndexMap::new();
+        let mut status_details = Vec::new();
+        if !grpc_status.details().is_empty() {
+            if let Ok(status) = GrpcStatus::decode(grpc_status.details()) {
+                obj.insert(Name::new("code"), status.code.into());
+                obj.insert(Name::new("message"), status.message.clone().into());
+
+                for detail in status.details {
+                    let type_url = &detail.type_url;
+                    let type_name = type_url.split('/').last().unwrap_or("");
+
+                    if let Some(message) = operation.find_message(type_name) {
+                        if let Ok(decoded) = message.decode(detail.value.as_slice()) {
+                            status_details.push(decoded);
+                        } else {
+                            tracing::error!("Error while decoding message: {type_name}");
+                        }
+                    } else {
+                        tracing::error!(
+                            "Error while searching descriptor for message: {type_name}"
+                        );
+                    }
+                }
+            } else {
+                tracing::error!("Error while decoding gRPC status details");
+            }
+        }
+        obj.insert(Name::new("details"), ConstValue::List(status_details));
+
+        let error = Error::GRPCError {
+            grpc_code: grpc_status.code() as i32,
+            grpc_description: grpc_status.code().description().to_owned(),
+            grpc_status_message: grpc_status.message().to_owned(),
+            grpc_status_details: ConstValue::Object(obj),
+        };
+
+        // TODO: because of this conversion to anyhow::Error
+        // we lose additional details that could be added
+        // through async_graphql::ErrorExtensions
+        anyhow::Error::new(error)
     }
 }
 
@@ -99,56 +153,6 @@ impl Response<Bytes> {
         Ok(resp)
     }
 
-    pub fn to_grpc_error(&self, operation: &ProtobufOperation) -> anyhow::Error {
-        let grpc_status = match Status::from_header_map(&self.headers) {
-            Some(status) => status,
-            None => {
-                return Error::IOException("Error while parsing upstream headers".to_owned()).into()
-            }
-        };
-
-        let mut obj: IndexMap<Name, async_graphql::Value> = IndexMap::new();
-        let mut status_details = Vec::new();
-        if !grpc_status.details().is_empty() {
-            if let Ok(status) = GrpcStatus::decode(grpc_status.details()) {
-                obj.insert(Name::new("code"), status.code.into());
-                obj.insert(Name::new("message"), status.message.clone().into());
-
-                for detail in status.details {
-                    let type_url = &detail.type_url;
-                    let type_name = type_url.split('/').last().unwrap_or("");
-
-                    if let Some(message) = operation.find_message(type_name) {
-                        if let Ok(decoded) = message.decode(detail.value.as_slice()) {
-                            status_details.push(decoded);
-                        } else {
-                            tracing::error!("Error while decoding message: {type_name}");
-                        }
-                    } else {
-                        tracing::error!(
-                            "Error while searching descriptor for message: {type_name}"
-                        );
-                    }
-                }
-            } else {
-                tracing::error!("Error while decoding gRPC status details");
-            }
-        }
-        obj.insert(Name::new("details"), ConstValue::List(status_details));
-
-        let error = Error::GRPCError {
-            grpc_code: grpc_status.code() as i32,
-            grpc_description: grpc_status.code().description().to_owned(),
-            grpc_status_message: grpc_status.message().to_owned(),
-            grpc_status_details: ConstValue::Object(obj),
-        };
-
-        // TODO: because of this conversion to anyhow::Error
-        // we lose additional details that could be added
-        // through async_graphql::ErrorExtensions
-        anyhow::Error::new(error)
-    }
-
     pub fn to_resp_string(self) -> Result<Response<String>> {
         Ok(Response::<String> {
             body: String::from_utf8(self.body.to_vec())?,
@@ -165,4 +169,31 @@ impl From<Response<Bytes>> for hyper::Response<Body> {
         *response.status_mut() = resp.status;
         response
     }
+}
+
+impl Response<Box<dyn Stream<Item = reqwest::Result<Bytes>>>> {
+    pub async fn stream_from_reqwest(resp: reqwest::Response) -> Result<Self> {
+        let status = resp.status();
+        let headers = resp.headers().to_owned();
+        let body = Box::new(resp.bytes_stream());
+        Ok(Response { status, headers, body })
+    }
+
+    pub fn to_grpc_stream(
+        self,
+        operation: &ProtobufOperation,
+    ) -> Result<Response<Box<dyn Stream<Item = async_graphql::Value>>>> {
+        let mut resp = Response::default();
+        resp.status = self.status;
+        resp.headers = self.headers;
+
+        resp.body = Box::new(async_stream::try_stream! {
+            while let Some(body) = self.body.next().await {
+                yield operation.convert_output::<async_graphql::Value>(&body)?;
+            }
+        });
+
+        Ok(resp)
+    }
+
 }

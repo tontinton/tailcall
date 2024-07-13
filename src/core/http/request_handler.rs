@@ -4,9 +4,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_graphql::ServerError;
+use futures_util::{SinkExt, StreamExt};
 use hyper::header::{self, HeaderValue, CONTENT_TYPE};
 use hyper::http::Method;
 use hyper::{Body, HeaderMap, Request, Response, StatusCode};
+use hyper_tungstenite::tungstenite::Message;
 use opentelemetry::trace::SpanKind;
 use opentelemetry_semantic_conventions::trace::{HTTP_REQUEST_METHOD, HTTP_ROUTE};
 use prometheus::{Encoder, ProtobufEncoder, TextEncoder, TEXT_FORMAT};
@@ -287,7 +289,7 @@ async fn handle_rest_apis(
 }
 
 async fn handle_request_inner<T: DeserializeOwned + GraphQLRequestLike>(
-    req: Request<Body>,
+    mut req: Request<Body>,
     app_ctx: Arc<AppContext>,
     req_counter: &mut RequestCounter,
 ) -> Result<Response<Body>> {
@@ -315,6 +317,36 @@ async fn handle_request_inner<T: DeserializeOwned + GraphQLRequestLike>(
             graphql_request::<T>(req, &app_ctx, req_counter).await
         }
 
+        hyper::Method::GET if req.uri().path() == "/graphql" && hyper_tungstenite::is_upgrade_request(&req) => {
+            let (response, websocket) = hyper_tungstenite::upgrade(&mut req, None)?;
+            tokio::spawn(async move {
+                if let Ok(mut websocket) = websocket.await {
+                    while let Some(Ok(message)) = websocket.next().await {
+                        dbg!(&message);
+                        if let Message::Text(text) = message {
+                            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            match value["type"].as_str() {
+                                Some("connection_init") => {
+                                    websocket.send(Message::Text(r#"{"type":"connection_ack"}"#.to_string())).await.unwrap();
+                                }
+                                Some("subscribe") => {
+                                    let a = value["payload"]["query"].as_str();
+                                    dbg!(&a);
+                                    let mut stream = app_ctx.schema.execute_stream(a.unwrap());
+                                    while let Some(response) = stream.next().await {
+                                        let response_text = serde_json::to_string(&response).unwrap();
+                                        println!("{}", response_text);
+                                        websocket.send(Message::Text(response_text)).await.unwrap();
+                                    }
+                                }
+                                _ => {}
+                            };
+                        }
+                    }
+                }
+            });
+            Ok(response)
+        }
         hyper::Method::GET => {
             if let Some(TelemetryExporter::Prometheus(prometheus)) =
                 app_ctx.blueprint.telemetry.export.as_ref()

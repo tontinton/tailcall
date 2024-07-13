@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use futures_util::Stream;
 use http_cache_reqwest::{Cache, CacheMode, HttpCache, HttpCacheOptions};
 use hyper::body::Bytes;
 use once_cell::sync::Lazy;
@@ -125,10 +126,7 @@ impl NativeHttp {
             enable_telemetry: telemetry.export.is_some(),
         }
     }
-}
 
-#[async_trait::async_trait]
-impl HttpIO for NativeHttp {
     #[allow(clippy::blocks_in_conditions)]
     // because of the issue with tracing and clippy - https://github.com/rust-lang/rust-clippy/issues/12281
     #[tracing::instrument(
@@ -142,7 +140,7 @@ impl HttpIO for NativeHttp {
             network.protocol.version = ?request.version()
         )
     )]
-    async fn execute(&self, mut request: reqwest::Request) -> Result<Response<Bytes>> {
+    async fn send_request(&self, mut request: reqwest::Request) -> Result<reqwest::Response> {
         if self.http2_only {
             *request.version_mut() = reqwest::Version::HTTP_2;
         }
@@ -175,8 +173,27 @@ impl HttpIO for NativeHttp {
             tracing::Span::current().set_attribute(status_code.key, status_code.value);
         }
 
+        Ok(response?)
+    }
+}
+
+#[async_trait::async_trait]
+impl HttpIO for NativeHttp {
+    async fn execute(&self, request: reqwest::Request) -> Result<Response<Bytes>> {
         Ok(Response::from_reqwest(
-            response?
+            self.send_request(request).await?
+                .error_for_status()
+                .map_err(|err| err.without_url())?,
+        )
+        .await?)
+    }
+
+    async fn stream(
+        &self,
+        request: reqwest::Request,
+    ) -> anyhow::Result<Response<Box<dyn Stream<Item = reqwest::Result<Bytes>>>>> {
+        Ok(Response::<Box<dyn Stream<Item = reqwest::Result<Bytes>>>>::stream_from_reqwest(
+            self.send_request(request).await?
                 .error_for_status()
                 .map_err(|err| err.without_url())?,
         )
