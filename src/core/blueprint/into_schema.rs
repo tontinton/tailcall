@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use async_graphql::dynamic::{self, FieldFuture, FieldValue, SchemaBuilder};
+use async_graphql::dynamic::{self, FieldFuture, FieldValue, SchemaBuilder, SubscriptionFieldFuture};
 use async_graphql::ErrorExtensions;
 use async_graphql_value::ConstValue;
 use futures_util::TryFutureExt;
@@ -83,6 +83,97 @@ fn to_field_value<'a>(
 
 fn to_type(def: &Definition) -> dynamic::Type {
     match def {
+        Definition::Object(def) if def.name == "Subscription" => {
+            let mut object = dynamic::Subscription::new(def.name.clone());
+            for field in def.fields.iter() {
+                let field = field.clone();
+                let type_ref = to_type_ref(&field.of_type);
+                let field_name = &field.name.clone();
+
+                let mut dyn_schema_field = dynamic::SubscriptionField::new(
+                    field_name,
+                    type_ref.clone(),
+                    move |ctx| {
+                        // region: HOT CODE
+                        // --------------------------------------------------
+                        //                HOT CODE STARTS HERE
+                        // --------------------------------------------------
+
+                        let req_ctx = ctx.ctx.data::<Arc<RequestContext>>().unwrap();
+                        let field_name = &field.name;
+
+                        match &field.resolver {
+                            None => {
+                                // let ctx: ResolverContext = ctx.into();
+                                // let ctx = EvalContext::new(req_ctx, &ctx);
+                                //
+                                // match ctx.path_value(&[field_name]).map(|a| a.into_owned()) {
+                                //     Some(ConstValue::Null) => SubscriptionFieldFuture::new(async {Ok(FieldValue::NONE)}),
+                                //     a => SubscriptionFieldFuture::new(async move {
+                                //         async_stream::try_stream!{
+                                //             loop {
+                                //                 yield Ok(a);
+                                //             }
+                                //         }
+                                //     }),
+                                // }
+                                panic!("unsupported");
+                            }
+                            Some(expr) => {
+                                let span = tracing::info_span!(
+                                    "field_resolver",
+                                    otel.name = ctx.path_node.map(|p| p.to_string()).unwrap_or(field_name.clone()), graphql.returnType = %type_ref
+                                );
+
+                                let ctx = ctx.to_owned();
+                                let expr = expr.to_owned();
+                                SubscriptionFieldFuture::new(
+                                    async move {
+                                        Ok(async_stream::try_stream! {
+                                            loop {
+                                                let ctx: ResolverContext = ctx.into();
+                                                let ctx = &mut EvalContext::new(req_ctx, &ctx);
+
+                                                let value =
+                                                    expr.eval(ctx).await.map_err(|err| err.extend())?;
+
+                                                if let ConstValue::Null = value {
+                                                    yield FieldValue::NULL;
+                                                } else {
+                                                    yield to_field_value(ctx, value)?;
+                                                }
+                                            }
+                                        })
+                                    }
+                                    .instrument(span)
+                                    .inspect_err(|err| tracing::error!(?err)),
+                                )
+                            }
+                        }
+
+                        // --------------------------------------------------
+                        //                HOT CODE ENDS HERE
+                        // --------------------------------------------------
+                        // endregion: hot_code
+                    },
+                );
+                if let Some(description) = &field.description {
+                    dyn_schema_field = dyn_schema_field.description(description);
+                }
+                for arg in field.args.iter() {
+                    dyn_schema_field = dyn_schema_field.argument(set_default_value(
+                        dynamic::InputValue::new(arg.name.clone(), to_type_ref(&arg.of_type)),
+                        arg.default_value.clone(),
+                    ));
+                }
+                object = object.field(dyn_schema_field);
+            }
+            if let Some(description) = &def.description {
+                object = object.description(description);
+            }
+
+            dynamic::Type::Subscription(object)
+        }
         Definition::Object(def) => {
             let mut object = dynamic::Object::new(def.name.clone());
             for field in def.fields.iter() {

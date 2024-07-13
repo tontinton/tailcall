@@ -19,7 +19,7 @@ message News {
 }
 
 service NewsService {
-  rpc GetAllNews(google.protobuf.Empty) returns (NewsList) {}
+  rpc GetAllNews (google.protobuf.Empty) returns (stream News) {}
   rpc GetNews(NewsId) returns (News) {}
   rpc GetMultipleNews(MultipleNewsId) returns (NewsList) {}
   rpc DeleteNews(NewsId) returns (google.protobuf.Empty) {}

@@ -133,7 +133,10 @@ impl TryFrom<&ConfigModule> for Blueprint {
                 let schema_builder = SchemaBuilder::from(&blueprint);
                 match schema_builder.finish() {
                     Ok(_) => Valid::succeed(blueprint),
-                    Err(e) => Valid::fail(e.to_string()),
+                    Err(e) => {
+                        dbg!(&e);
+                        Valid::fail(e.to_string())
+                    }
                 }
             })
             .to_result()
